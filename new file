@@ -1,1 +1,191 @@
+gotcha — here’s the short, practical “mental model” for your service, plus the tech + skills to be productive fast.
+
+1) End‑to‑end flow (happy path + timeout)
+
+1. HTTP in (PSP → REST API)
+
+INSRestServiceController.performRequest(...) accepts FraudCheckRequest (OpenAPI‑generated).
+
+It creates a DeferredResult with a 4.5s timeout.
+
+Validates & immediately persists the raw JSON (status RAW_PAYLOAD_SAVE) via PersistFraudCheckRequestService.
+
+
+
+2. Map → fixed‑length → MQ (PreFAI/Falcon)
+
+CustomObjectMapper.mapFraudCheckEventToFixedRecord(...) builds 117-field FraudCheckRequestFixedRecord (Bindy).
+
+Status updated to FIXED_LEN_PAYLOAD_SAVE.
+
+MQDispatchService.publishFraudCheckRequestFixedRecord(...) sends the fixed‑length message through Apache Camel to IBM MQ (your outgoing route).
+
+
+
+3. Wait for decision (inside the 4.5s window)
+
+The DeferredResult for messageId is parked in DeferredResultsService (ConcurrentMap).
+
+
+
+4. Receive decision (PreFAI/Falcon → MQ → Camel)
+
+Your incoming route consumes the response fixed‑length message from IBM MQ.
+
+Camel unmarshals it to FraudCheckEventResponseFixedRecord (Bindy).
+
+SaveFAIResponseJSONProcessor persists the response JSON (RESPONSE_PAYLOAD_SAVE).
+
+DeferredResultsService.doResultUpdate(...) finds the waiting DeferredResult and completes the HTTP call with a FraudCheckResponse (APPROVE/DECLINED/QUARANTINE).
+
+
+
+5. Timeout path (no decision <= 4.5s)
+
+On timeout, controller returns HTTP 200 body with transactionDecision = TIMEOUT (and logs).
+
+Later, when the MQ response arrives and is saved, the scheduled job ResponseProcessJob loads stored decisions for any still‑tracked messageIds and triggers notification (WebClient) to the Event Router/Gateway so downstream systems are updated.
+
+
+
+
+> TL;DR: REST in → save → map → MQ → decision back via MQ → complete async HTTP (or TIMEOUT + later notify).
+
+
+
+2) Main building blocks (where to look)
+
+Controller: INSRestServiceController (DeferredResult + timeout).
+
+Facade: FraudVerifyActionsFacade(Impl) wires the steps.
+
+Mapper/Utils: CustomObjectMapper, INSRestServiceUtils.
+
+Persistence: FraudCheckRequestEntity, FraudCheckRequestRepository (PostgreSQL + JPA).
+
+Camel Routes:
+
+Outgoing: OutgoingRoute (marshal fixed‑length → JMS).
+
+Incoming: IncomingRoute (JMS → unmarshal fixed‑length → processors).
+
+
+Processors: SaveFAIResponseJSONProcessor, SaveFraudCheckFixedLengthProcessor, FAIPreProcessor.
+
+MQ: MQDispatchService(Impl); config in IBMMQConfiguration.
+
+Async store: DeferredResultsService(Impl) keeps the map of messageId → DeferredResult.
+
+Notification: NotificationRestService(Impl) uses Spring WebClient (with custom SSL) to call Event Router.
+
+Scheduler: ResponseProcessJob.
+
+Config: application.yml, DataSourceConfig, WebClientSslConfiguration, CREATE psp_fraudcheckrequest_data.sql.
+
+
+3) Tech & tools you’re using
+
+Java + Spring Boot (MVC): REST controller, DeferredResult async pattern.
+
+Apache Camel: RouteBuilder, direct: endpoints, Bindy (fixed‑length marshal/unmarshal), JMS component.
+
+IBM MQ: JMS queues; SSL/TLS; XA optional.
+
+JPA/Hibernate + PostgreSQL: repository pattern, HikariCP (pool).
+
+Jackson: JSON binding; ObjectMapper everywhere.
+
+Bean Validation (Jakarta/JSR‑380): @NotNull, @Size on the OpenAPI models.
+
+Lombok: @Data @Builder @RequiredArgsConstructor etc.
+
+WebClient (Reactor Netty): outbound REST to Event Router (with custom keystore/truststore).
+
+Scheduling: @Scheduled.
+
+Testing: JUnit/Mockito (unit tests for controller, processors, services).
+
+
+4) Skills to be effective (checklist)
+
+1. Spring MVC async: DeferredResult, request timeouts, error handling.
+
+
+2. Camel basics: routes, processors, marshal()/unmarshal(), Bindy fixed‑length mapping, JMS endpoints, error handlers.
+
+
+3. Fixed‑length protocols: field positions, alignment, padding, and regression tests to lock the layout.
+
+
+4. JMS/IBM MQ: connection factories, SSL/keystores, channels/queue managers, message headers (correlation/messageId).
+
+
+5. SQL/JPA: entity modeling, @Transactional (incl. REQUIRES_NEW), native queries, performance (indexes on message_id).
+
+
+6. WebClient + TLS: building clients, timeouts/retries, custom SSL context.
+
+
+7. Observability: structured logging with messageId; know where to put logs for tracing the path.
+
+
+8. Concurrency: when to use thread pools vs Camel async; avoiding blocking in processors.
+
+
+9. OpenAPI models: generated DTOs style, validation annotations, versioning without breaking clients.
+
+
+
+5) How to read/extend the code “the same way”
+
+Follow the flow: Controller → Facade → Services → Routes/Processors → Repository.
+
+Always persist state transitions: update RequestStatus at each step.
+
+Keep idempotency by messageId: repository’s findMostRecentByMessageId pattern.
+
+Add fields safely:
+
+Add to FraudCheckRequestFixedRecord with correct @DataField(pos=…, length=…, align=…, paddingChar=…).
+
+Update CustomObjectMapper to populate the new field.
+
+If the response changes, add to FraudCheckEventResponseFixedRecord and mapping back to FraudCheckResponse.
+
+
+Add a new decision: extend TransactionDecision enum (code → enum), update mapping in INSRestServiceUtils.
+
+Integrate a new route/queue: create a new RouteBuilder, wire a Processor, add config to application.yml, and expose a small service method in MQDispatchService.
+
+
+6) Local dev smoke‑run (quick)
+
+PostgreSQL up; run the DDL under resources/database.
+
+Set application.yml DB creds and disable MQ by using the direct: endpoints (already wired) or point to a test queue.
+
+Run INSRestServiceApplication.
+
+POST a sample JSON to /v1/fraudinsto/fraudCheck.
+
+Use the sample prefai response to simulate MQ: drop it into the incoming route (or call the Processor directly in a test).
+
+Watch the log for: RAW_PAYLOAD_SAVE → FIXED_LEN_PAYLOAD_SAVE → FIXED_LEN_PAYLOAD_SENT → RESPONSE_PAYLOAD_SAVE.
+
+
+7) Common “gotchas”
+
+Timeouts: Controller timeout must match business SLA; set Camel/MQ/WebClient timeouts sensibly.
+
+Character set & padding: Bindy + IBM MQ CCSID mismatches cause subtle field shifts—lock with tests.
+
+SSL paths: classpath vs filesystem — both have helpers; verify in each environment.
+
+Transactions: you use REQUIRES_NEW while updating status; ensure this is intentional to commit each step independently.
+
+Indexes: add an index on message_id for lookups by the scheduler & updates.
+
+
+If you want, I can annotate your current classes with inline comments (what/why), or add a small sequence diagram in the repo README so new devs can grok the flow in 60 seconds.
+
 
